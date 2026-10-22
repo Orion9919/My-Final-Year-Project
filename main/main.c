@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -16,8 +17,25 @@
 #define BH1750_ADDRESS      0x23
 #define BH1750_POWER_ON_CMD 0x01
 #define BH1750_MEASURE_CMD  0x20
+#define PMS5003_UART_NUM    UART_NUM_2
+#define PMS5003_RX_GPIO     16
+#define PMS5003_TX_GPIO     17
+#define PMS5003_BAUD_RATE   9600
+#define PMS5003_FRAME_SIZE  32
+#define PMS5003_FRAME_LENGTH 28
 
-static const char *TAG = "sht31";
+static const char *TAG = "sensors";
+
+typedef struct {
+    uint16_t pm1_0;
+    uint16_t pm2_5;
+    uint16_t pm10;
+    TickType_t last_update;
+    bool valid;
+} pms5003_data_t;
+
+static pms5003_data_t pms5003_data;
+static portMUX_TYPE pms5003_data_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static uint8_t sht31_crc8(const uint8_t *data, size_t length)
 {
@@ -82,6 +100,109 @@ static esp_err_t bh1750_read(i2c_master_dev_handle_t device, float *illuminance)
     return ESP_OK;
 }
 
+static void pms5003_parser_reset(uint8_t *frame, size_t *position)
+{
+    (void)frame;
+    *position = 0;
+}
+
+static void pms5003_process_frame(const uint8_t *frame)
+{
+    uint16_t checksum = 0;
+    for (size_t i = 0; i < PMS5003_FRAME_SIZE - 2; ++i) {
+        checksum += frame[i];
+    }
+
+    uint16_t received_checksum = ((uint16_t)frame[30] << 8) | frame[31];
+    if (checksum != received_checksum) {
+        ESP_LOGW(TAG, "PMS5003 checksum error");
+        return;
+    }
+
+    // Data 4/5/6 are atmospheric PM1.0/PM2.5/PM10 values.
+    uint16_t pm1_0 = ((uint16_t)frame[10] << 8) | frame[11];
+    uint16_t pm2_5 = ((uint16_t)frame[12] << 8) | frame[13];
+    uint16_t pm10 = ((uint16_t)frame[14] << 8) | frame[15];
+
+    portENTER_CRITICAL(&pms5003_data_lock);
+    pms5003_data.pm1_0 = pm1_0;
+    pms5003_data.pm2_5 = pm2_5;
+    pms5003_data.pm10 = pm10;
+    pms5003_data.last_update = xTaskGetTickCount();
+    pms5003_data.valid = true;
+    portEXIT_CRITICAL(&pms5003_data_lock);
+}
+
+static void pms5003_parser_feed(uint8_t byte, uint8_t *frame, size_t *position)
+{
+    if (*position == 0) {
+        if (byte == 0x42) {
+            frame[(*position)++] = byte;
+        }
+        return;
+    }
+
+    if (*position == 1) {
+        if (byte == 0x4D) {
+            frame[(*position)++] = byte;
+        } else {
+            pms5003_parser_reset(frame, position);
+            if (byte == 0x42) {
+                frame[(*position)++] = byte;
+            }
+        }
+        return;
+    }
+
+    frame[(*position)++] = byte;
+    if (*position == 4) {
+        uint16_t frame_length = ((uint16_t)frame[2] << 8) | frame[3];
+        if (frame_length != PMS5003_FRAME_LENGTH) {
+            pms5003_parser_reset(frame, position);
+        }
+    } else if (*position == PMS5003_FRAME_SIZE) {
+        pms5003_process_frame(frame);
+        pms5003_parser_reset(frame, position);
+    }
+}
+
+static void pms5003_task(void *arg)
+{
+    (void)arg;
+    uint8_t receive_buffer[128];
+    uint8_t frame[PMS5003_FRAME_SIZE] = {0};
+    size_t position = 0;
+
+    while (true) {
+        int received = uart_read_bytes(PMS5003_UART_NUM, receive_buffer, sizeof(receive_buffer),
+                                       pdMS_TO_TICKS(100));
+        for (int i = 0; i < received; ++i) {
+            pms5003_parser_feed(receive_buffer[i], frame, &position);
+        }
+    }
+}
+
+static esp_err_t pms5003_uart_init(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = PMS5003_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_RETURN_ON_ERROR(uart_param_config(PMS5003_UART_NUM, &uart_config), TAG,
+                        "failed to configure PMS5003 UART");
+    ESP_RETURN_ON_ERROR(uart_set_pin(PMS5003_UART_NUM, PMS5003_TX_GPIO, PMS5003_RX_GPIO,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE), TAG,
+                        "failed to set PMS5003 UART pins");
+    ESP_RETURN_ON_ERROR(uart_driver_install(PMS5003_UART_NUM, 1024, 0, 0, NULL, 0), TAG,
+                        "failed to install PMS5003 UART driver");
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     i2c_master_bus_config_t bus_config = {
@@ -134,29 +255,58 @@ void app_main(void)
                  esp_err_to_name(bh1750_error));
     }
 
+    esp_err_t pms5003_error = pms5003_uart_init();
+    if (pms5003_error == ESP_OK) {
+        xTaskCreate(pms5003_task, "pms5003_task", 3072, NULL, 5, NULL);
+        ESP_LOGI(TAG, "PMS5003 UART2 ready: RX GPIO%d, TX GPIO%d", PMS5003_RX_GPIO,
+                 PMS5003_TX_GPIO);
+    } else {
+        ESP_LOGW(TAG, "PMS5003 unavailable: %s", esp_err_to_name(pms5003_error));
+    }
+
     while (true) {
         float temperature = 0.0f;
         float humidity = 0.0f;
-        esp_err_t error = sht31_read(device, &temperature, &humidity);
-        if (error == ESP_OK) {
-            if (bh1750_device != NULL) {
-                float illuminance = 0.0f;
-                esp_err_t bh1750_read_error = bh1750_read(bh1750_device, &illuminance);
-                if (bh1750_read_error == ESP_OK) {
-                    ESP_LOGI(TAG, "temperature: %.2f C, humidity: %.2f %%RH, illuminance: %.2f lux",
-                             temperature, humidity, illuminance);
-                } else {
-                    ESP_LOGE(TAG, "BH1750 measurement failed: %s", esp_err_to_name(bh1750_read_error));
-                    ESP_LOGI(TAG, "temperature: %.2f C, humidity: %.2f %%RH, illuminance: unavailable",
-                             temperature, humidity);
-                }
-            } else {
-                ESP_LOGI(TAG, "temperature: %.2f C, humidity: %.2f %%RH, illuminance: unavailable",
-                         temperature, humidity);
-            }
-        } else {
-            ESP_LOGE(TAG, "measurement failed: %s", esp_err_to_name(error));
+        float illuminance = 0.0f;
+        esp_err_t sht31_error = sht31_read(device, &temperature, &humidity);
+        esp_err_t bh1750_read_error = ESP_ERR_NOT_FOUND;
+        if (bh1750_device != NULL) {
+            bh1750_read_error = bh1750_read(bh1750_device, &illuminance);
         }
+
+        if (sht31_error != ESP_OK) {
+            ESP_LOGE(TAG, "SHT31 measurement failed: %s", esp_err_to_name(sht31_error));
+        }
+        if (bh1750_read_error != ESP_OK) {
+            ESP_LOGE(TAG, "BH1750 measurement failed: %s", esp_err_to_name(bh1750_read_error));
+        }
+
+        pms5003_data_t pms_data;
+        portENTER_CRITICAL(&pms5003_data_lock);
+        pms_data = pms5003_data;
+        portEXIT_CRITICAL(&pms5003_data_lock);
+        bool pms_available = pms_data.valid &&
+                             (xTaskGetTickCount() - pms_data.last_update <= pdMS_TO_TICKS(5000));
+
+        char temperature_text[32];
+        char humidity_text[32];
+        char illuminance_text[32];
+        char pms_text[80];
+        snprintf(temperature_text, sizeof(temperature_text),
+                 sht31_error == ESP_OK ? "%.2f C" : "unavailable", temperature);
+        snprintf(humidity_text, sizeof(humidity_text),
+                 sht31_error == ESP_OK ? "%.2f %%RH" : "unavailable", humidity);
+        snprintf(illuminance_text, sizeof(illuminance_text),
+                 bh1750_read_error == ESP_OK ? "%.2f lux" : "unavailable", illuminance);
+        if (pms_available) {
+            snprintf(pms_text, sizeof(pms_text), "PM1.0: %u, PM2.5: %u, PM10: %u ug/m3",
+                     pms_data.pm1_0, pms_data.pm2_5, pms_data.pm10);
+        } else {
+            snprintf(pms_text, sizeof(pms_text), "PMS5003: waiting for valid data");
+        }
+        ESP_LOGI(TAG, "temperature: %s, humidity: %s, illuminance: %s, ambient %s",
+                 temperature_text, humidity_text, illuminance_text, pms_text);
+
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
