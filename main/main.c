@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
@@ -23,6 +24,11 @@
 #define PMS5003_BAUD_RATE   9600
 #define PMS5003_FRAME_SIZE  32
 #define PMS5003_FRAME_LENGTH 28
+#define SSD1305_ADDRESS_A   0x3C
+#define SSD1305_ADDRESS_B   0x3D
+#define SSD1305_WIDTH       128
+#define SSD1305_HEIGHT      64
+#define SSD1305_COLUMN_OFFSET 2
 
 static const char *TAG = "sensors";
 
@@ -36,6 +42,155 @@ typedef struct {
 
 static pms5003_data_t pms5003_data;
 static portMUX_TYPE pms5003_data_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static const uint8_t font5x7[][5] = {
+    [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
+    ['%'] = {0x62, 0x64, 0x08, 0x13, 0x23},
+    ['.'] = {0x00, 0x60, 0x60, 0x00, 0x00},
+    [':'] = {0x00, 0x36, 0x36, 0x00, 0x00},
+    ['-'] = {0x08, 0x08, 0x08, 0x08, 0x08},
+    ['0'] = {0x3E, 0x51, 0x49, 0x45, 0x3E},
+    ['1'] = {0x00, 0x42, 0x7F, 0x40, 0x00},
+    ['2'] = {0x42, 0x61, 0x51, 0x49, 0x46},
+    ['3'] = {0x21, 0x41, 0x45, 0x4B, 0x31},
+    ['4'] = {0x18, 0x14, 0x12, 0x7F, 0x10},
+    ['5'] = {0x27, 0x45, 0x45, 0x45, 0x39},
+    ['6'] = {0x3C, 0x4A, 0x49, 0x49, 0x30},
+    ['7'] = {0x01, 0x71, 0x09, 0x05, 0x03},
+    ['8'] = {0x36, 0x49, 0x49, 0x49, 0x36},
+    ['9'] = {0x06, 0x49, 0x49, 0x29, 0x1E},
+    ['A'] = {0x7E, 0x11, 0x11, 0x11, 0x7E},
+    ['B'] = {0x7F, 0x49, 0x49, 0x49, 0x36},
+    ['C'] = {0x3E, 0x41, 0x41, 0x41, 0x22},
+    ['D'] = {0x7F, 0x41, 0x41, 0x22, 0x1C},
+    ['E'] = {0x7F, 0x49, 0x49, 0x49, 0x41},
+    ['G'] = {0x3E, 0x41, 0x49, 0x49, 0x7A},
+    ['H'] = {0x7F, 0x08, 0x08, 0x08, 0x7F},
+    ['I'] = {0x00, 0x41, 0x7F, 0x41, 0x00},
+    ['L'] = {0x7F, 0x40, 0x40, 0x40, 0x40},
+    ['M'] = {0x7F, 0x02, 0x0C, 0x02, 0x7F},
+    ['P'] = {0x7F, 0x09, 0x09, 0x09, 0x06},
+    ['R'] = {0x7F, 0x09, 0x19, 0x29, 0x46},
+    ['T'] = {0x01, 0x01, 0x7F, 0x01, 0x01},
+    ['U'] = {0x3F, 0x40, 0x40, 0x40, 0x3F},
+    ['X'] = {0x63, 0x14, 0x08, 0x14, 0x63},
+    ['Y'] = {0x03, 0x04, 0x78, 0x04, 0x03},
+};
+
+static uint8_t ssd1305_framebuffer[SSD1305_HEIGHT / 8][SSD1305_WIDTH];
+
+static esp_err_t ssd1305_command(i2c_master_dev_handle_t device, const uint8_t *commands,
+                                 size_t length)
+{
+    uint8_t buffer[32];
+    if (length + 1 > sizeof(buffer)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    buffer[0] = 0x00;
+    memcpy(buffer + 1, commands, length);
+    return i2c_master_transmit(device, buffer, length + 1, 100);
+}
+
+static esp_err_t ssd1305_init(i2c_master_dev_handle_t device)
+{
+    static const uint8_t commands[] = {
+        0xAE,       // display off
+        0xD5, 0x80, // clock divide ratio / oscillator
+        0xA8, 0x3F, // 64 multiplex
+        0xD3, 0x00, // display offset
+        0x40,       // display start line 0
+        0xAD, 0x00, // external VCC configuration
+        0xA1,       // segment remap
+        0xC8,       // COM scan direction remap
+        0xDA, 0x12, // COM pins configuration
+        0x81, 0x80, // contrast
+        0xD9, 0xF1, // pre-charge
+        0xDB, 0x34, // VCOMH deselect level
+        0xA4,       // display follows RAM
+        0xA6,       // normal display
+        0x20, 0x02, // page addressing mode
+        0xAF        // display on
+    };
+    memset(ssd1305_framebuffer, 0, sizeof(ssd1305_framebuffer));
+    return ssd1305_command(device, commands, sizeof(commands));
+}
+
+static void ssd1305_clear(void)
+{
+    memset(ssd1305_framebuffer, 0, sizeof(ssd1305_framebuffer));
+}
+
+static void ssd1305_draw_text(uint8_t x, uint8_t page, const char *text)
+{
+    while (*text != '\0' && x + 5 < SSD1305_WIDTH) {
+        unsigned char character = (unsigned char)*text++;
+        if (character < sizeof(font5x7) / sizeof(font5x7[0])) {
+            memcpy(&ssd1305_framebuffer[page][x], font5x7[character], 5);
+        }
+        x += 6;
+    }
+}
+
+static void ssd1305_draw_right_text(uint8_t page, const char *text)
+{
+    size_t length = strlen(text);
+    uint8_t width = (uint8_t)(length * 6);
+    ssd1305_draw_text(width < SSD1305_WIDTH ? SSD1305_WIDTH - width : 0, page, text);
+}
+
+static esp_err_t ssd1305_refresh(i2c_master_dev_handle_t device)
+{
+    uint8_t commands[4];
+    uint8_t data[SSD1305_WIDTH + 1];
+    data[0] = 0x40;
+
+    for (uint8_t page = 0; page < SSD1305_HEIGHT / 8; ++page) {
+        commands[0] = (uint8_t)(0xB0 | page);
+        commands[1] = (uint8_t)(0x00 | (SSD1305_COLUMN_OFFSET & 0x0F));
+        commands[2] = (uint8_t)(0x10 | (SSD1305_COLUMN_OFFSET >> 4));
+        ESP_RETURN_ON_ERROR(ssd1305_command(device, commands, 3), TAG,
+                            "failed to set SSD1305 page");
+        memcpy(data + 1, ssd1305_framebuffer[page], SSD1305_WIDTH);
+        ESP_RETURN_ON_ERROR(i2c_master_transmit(device, data, sizeof(data), 100), TAG,
+                            "failed to write SSD1305 data");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ssd1305_update(i2c_master_dev_handle_t device, bool temperature_valid,
+                                float temperature, bool humidity_valid, float humidity,
+                                bool illuminance_valid, float illuminance,
+                                const pms5003_data_t *pms_data)
+{
+    char value[24];
+    ssd1305_clear();
+    ssd1305_draw_text(0, 0, "TEMPERATURE");
+    ssd1305_draw_text(0, 1, "HUMIDITY");
+    ssd1305_draw_text(0, 2, "LIGHT");
+    ssd1305_draw_text(0, 3, "PM1.0");
+    ssd1305_draw_text(0, 4, "PM2.5");
+    ssd1305_draw_text(0, 5, "PM10");
+
+    snprintf(value, sizeof(value), temperature_valid ? "%.1f C" : "--", temperature);
+    ssd1305_draw_right_text(0, value);
+    snprintf(value, sizeof(value), humidity_valid ? "%.1f %%" : "--", humidity);
+    ssd1305_draw_right_text(1, value);
+    snprintf(value, sizeof(value), illuminance_valid ? "%.0f LUX" : "--", illuminance);
+    ssd1305_draw_right_text(2, value);
+    if (pms_data->valid) {
+        snprintf(value, sizeof(value), "%u", pms_data->pm1_0);
+        ssd1305_draw_right_text(3, value);
+        snprintf(value, sizeof(value), "%u", pms_data->pm2_5);
+        ssd1305_draw_right_text(4, value);
+        snprintf(value, sizeof(value), "%u", pms_data->pm10);
+        ssd1305_draw_right_text(5, value);
+    } else {
+        ssd1305_draw_right_text(3, "--");
+        ssd1305_draw_right_text(4, "--");
+        ssd1305_draw_right_text(5, "--");
+    }
+    return ssd1305_refresh(device);
+}
 
 static uint8_t sht31_crc8(const uint8_t *data, size_t length)
 {
@@ -255,6 +410,32 @@ void app_main(void)
                  esp_err_to_name(bh1750_error));
     }
 
+    i2c_master_dev_handle_t ssd1305_device = NULL;
+    uint8_t ssd1305_address = SSD1305_ADDRESS_A;
+    esp_err_t ssd1305_error = i2c_master_probe(bus, SSD1305_ADDRESS_A, 100);
+    if (ssd1305_error != ESP_OK) {
+        ssd1305_address = SSD1305_ADDRESS_B;
+        ssd1305_error = i2c_master_probe(bus, SSD1305_ADDRESS_B, 100);
+    }
+    if (ssd1305_error == ESP_OK) {
+        i2c_device_config_t ssd1305_config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = ssd1305_address,
+            .scl_speed_hz = I2C_FREQUENCY_HZ,
+        };
+        ssd1305_error = i2c_master_bus_add_device(bus, &ssd1305_config, &ssd1305_device);
+        if (ssd1305_error == ESP_OK) {
+            ssd1305_error = ssd1305_init(ssd1305_device);
+        }
+        if (ssd1305_error == ESP_OK) {
+            ESP_LOGI(TAG, "SSD1305 detected at I2C address 0x%02X", ssd1305_address);
+        }
+    }
+    if (ssd1305_error != ESP_OK) {
+        ESP_LOGW(TAG, "SSD1305 unavailable at 0x%02X/0x%02X: %s", SSD1305_ADDRESS_A,
+                 SSD1305_ADDRESS_B, esp_err_to_name(ssd1305_error));
+    }
+
     esp_err_t pms5003_error = pms5003_uart_init();
     if (pms5003_error == ESP_OK) {
         xTaskCreate(pms5003_task, "pms5003_task", 3072, NULL, 5, NULL);
@@ -287,6 +468,7 @@ void app_main(void)
         portEXIT_CRITICAL(&pms5003_data_lock);
         bool pms_available = pms_data.valid &&
                              (xTaskGetTickCount() - pms_data.last_update <= pdMS_TO_TICKS(5000));
+        pms_data.valid = pms_available;
 
         char temperature_text[32];
         char humidity_text[32];
@@ -306,6 +488,16 @@ void app_main(void)
         }
         ESP_LOGI(TAG, "temperature: %s, humidity: %s, illuminance: %s, ambient %s",
                  temperature_text, humidity_text, illuminance_text, pms_text);
+
+        if (ssd1305_device != NULL) {
+            esp_err_t display_error = ssd1305_update(ssd1305_device, sht31_error == ESP_OK,
+                                                     temperature, sht31_error == ESP_OK, humidity,
+                                                     bh1750_read_error == ESP_OK, illuminance,
+                                                     &pms_data);
+            if (display_error != ESP_OK) {
+                ESP_LOGE(TAG, "SSD1305 refresh failed: %s", esp_err_to_name(display_error));
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
