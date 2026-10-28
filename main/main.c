@@ -43,6 +43,7 @@ typedef struct {
 static pms5003_data_t pms5003_data;
 static portMUX_TYPE pms5003_data_lock = portMUX_INITIALIZER_UNLOCKED;
 
+// 5x7 glyphs are stored by column, with one extra column between characters.
 static const uint8_t font5x7[][5] = {
     [' '] = {0x00, 0x00, 0x00, 0x00, 0x00},
     ['%'] = {0x62, 0x64, 0x08, 0x13, 0x23},
@@ -77,6 +78,7 @@ static const uint8_t font5x7[][5] = {
     ['Y'] = {0x03, 0x04, 0x78, 0x04, 0x03},
 };
 
+// Each page spans 8 pixel rows; each byte holds one column of 8 pixels.
 static uint8_t ssd1315_framebuffer[SSD1315_HEIGHT / 8][SSD1315_WIDTH];
 
 static esp_err_t ssd1315_command(i2c_master_dev_handle_t device, const uint8_t *commands,
@@ -86,7 +88,7 @@ static esp_err_t ssd1315_command(i2c_master_dev_handle_t device, const uint8_t *
     if (length + 1 > sizeof(buffer)) {
         return ESP_ERR_INVALID_SIZE;
     }
-    buffer[0] = 0x00;
+    buffer[0] = 0x00; // I2C control byte: following bytes are commands.
     memcpy(buffer + 1, commands, length);
     return i2c_master_transmit(device, buffer, length + 1, 100);
 }
@@ -134,6 +136,7 @@ static void ssd1315_draw_text(uint8_t x, uint8_t page, const char *text)
 
 static void ssd1315_draw_right_text(uint8_t page, const char *text)
 {
+    // Calculate the starting column from the text width for right alignment.
     size_t length = strlen(text);
     uint8_t width = (uint8_t)(length * 6);
     ssd1315_draw_text(width < SSD1315_WIDTH ? SSD1315_WIDTH - width : 0, page, text);
@@ -143,7 +146,7 @@ static esp_err_t ssd1315_refresh(i2c_master_dev_handle_t device)
 {
     uint8_t commands[4];
     uint8_t data[SSD1315_WIDTH + 1];
-    data[0] = 0x40;
+    data[0] = 0x40; // I2C control byte: following bytes are display RAM data.
 
     for (uint8_t page = 0; page < SSD1315_HEIGHT / 8; ++page) {
         commands[0] = (uint8_t)(0xB0 | page);
@@ -164,6 +167,7 @@ static esp_err_t ssd1315_update(i2c_master_dev_handle_t device, bool temperature
                                 const pms5003_data_t *pms_data)
 {
     char value[24];
+    // Redraw in memory before sending to the display; use -- for invalid readings.
     ssd1315_clear();
     ssd1315_draw_text(0, 0, "TEMPERATURE");
     ssd1315_draw_text(0, 1, "HUMIDITY");
@@ -195,6 +199,7 @@ static esp_err_t ssd1315_update(i2c_master_dev_handle_t device, bool temperature
 
 static uint8_t sht31_crc8(const uint8_t *data, size_t length)
 {
+    // SHT31 CRC-8: initial value 0xFF, polynomial 0x31.
     uint8_t crc = 0xFF;
 
     for (size_t i = 0; i < length; ++i) {
@@ -217,12 +222,13 @@ static esp_err_t sht31_read(i2c_master_dev_handle_t device, float *temperature, 
     ESP_RETURN_ON_ERROR(i2c_master_transmit(device, command, sizeof(command), 100), TAG,
                         "failed to start measurement");
 
-    // High-repeatability, no-clock-stretching measurement needs up to about 15 ms.
+    // High-repeatability mode without clock stretching takes up to about 15 ms.
     vTaskDelay(pdMS_TO_TICKS(20));
 
     ESP_RETURN_ON_ERROR(i2c_master_receive(device, data, sizeof(data), 100), TAG,
                         "failed to read measurement");
 
+    // Temperature and humidity each use two bytes followed by a CRC byte.
     if (sht31_crc8(data, 2) != data[2] || sht31_crc8(data + 3, 2) != data[5]) {
         return ESP_ERR_INVALID_CRC;
     }
@@ -245,14 +251,14 @@ static esp_err_t bh1750_read(i2c_master_dev_handle_t device, float *illuminance)
     ESP_RETURN_ON_ERROR(i2c_master_transmit(device, &measure_command, 1, 100), TAG,
                         "failed to start BH1750 measurement");
 
-    // One-time high-resolution measurement takes up to about 180 ms.
+    // Wait up to 180 ms for a one-time high-resolution measurement.
     vTaskDelay(pdMS_TO_TICKS(180));
 
     ESP_RETURN_ON_ERROR(i2c_master_receive(device, data, sizeof(data), 100), TAG,
                         "failed to read BH1750 measurement");
 
     uint16_t raw_illuminance = ((uint16_t)data[0] << 8) | data[1];
-    *illuminance = (float)raw_illuminance / 1.2f;
+    *illuminance = (float)raw_illuminance / 1.2f; // Convert to lux at the default measurement time.
     return ESP_OK;
 }
 
@@ -269,13 +275,14 @@ static void pms5003_process_frame(const uint8_t *frame)
         checksum += frame[i];
     }
 
+    // Sum the first 30 bytes and compare with the final two checksum bytes.
     uint16_t received_checksum = ((uint16_t)frame[30] << 8) | frame[31];
     if (checksum != received_checksum) {
         ESP_LOGW(TAG, "PMS5003 checksum error");
         return;
     }
 
-    // Data 4/5/6 are atmospheric PM1.0/PM2.5/PM10 values.
+    // Atmospheric PM concentrations (Data 4/5/6) in ug/m3; fields are big-endian.
     uint16_t pm1_0 = ((uint16_t)frame[10] << 8) | frame[11];
     uint16_t pm2_5 = ((uint16_t)frame[12] << 8) | frame[13];
     uint16_t pm10 = ((uint16_t)frame[14] << 8) | frame[15];
@@ -291,6 +298,7 @@ static void pms5003_process_frame(const uint8_t *frame)
 
 static void pms5003_parser_feed(uint8_t byte, uint8_t *frame, size_t *position)
 {
+    // Find header 0x42 0x4D, check length, then validate and parse a complete frame.
     if (*position == 0) {
         if (byte == 0x42) {
             frame[(*position)++] = byte;
@@ -327,7 +335,7 @@ static void pms5003_task(void *arg)
     (void)arg;
     uint8_t receive_buffer[128];
     uint8_t frame[PMS5003_FRAME_SIZE] = {0};
-    size_t position = 0;
+    size_t position = 0; // Keep parser state across reads to handle split and consecutive frames.
 
     while (true) {
         int received = uart_read_bytes(PMS5003_UART_NUM, receive_buffer, sizeof(receive_buffer),
@@ -361,13 +369,14 @@ static esp_err_t pms5003_uart_init(void)
 
 void app_main(void)
 {
+    // SHT31, BH1750 and OLED share one I2C bus, accessed sequentially by this task.
     i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = I2C_SDA_GPIO,
         .scl_io_num = I2C_SCL_GPIO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
-        // The SHT31 module already has I2C pull-up resistors fitted.
+        // The SHT31 module has external pull-ups, so internal pull-ups are disabled.
         .flags.enable_internal_pullup = false,
     };
     i2c_master_bus_handle_t bus = NULL;
@@ -439,6 +448,7 @@ void app_main(void)
 
     esp_err_t pms5003_error = pms5003_uart_init();
     if (pms5003_error == ESP_OK) {
+        // Receive UART data in a separate task to avoid blocking the main task.
         xTaskCreate(pms5003_task, "pms5003_task", 3072, NULL, 5, NULL);
         ESP_LOGI(TAG, "PMS5003 UART2 ready: RX GPIO%d, TX GPIO%d", PMS5003_RX_GPIO,
                  PMS5003_TX_GPIO);
@@ -463,10 +473,12 @@ void app_main(void)
             ESP_LOGE(TAG, "BH1750 measurement failed: %s", esp_err_to_name(bh1750_read_error));
         }
 
+        // Copy a complete snapshot under the lock to avoid partially updated readings.
         pms5003_data_t pms_data;
         portENTER_CRITICAL(&pms5003_data_lock);
         pms_data = pms5003_data;
         portEXIT_CRITICAL(&pms5003_data_lock);
+        // Treat readings as stale after 5 seconds without a valid frame.
         bool pms_available = pms_data.valid &&
                              (xTaskGetTickCount() - pms_data.last_update <= pdMS_TO_TICKS(5000));
         pms_data.valid = pms_available;
