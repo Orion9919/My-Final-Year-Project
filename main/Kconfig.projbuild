@@ -1,0 +1,15 @@
+menu "FYP Wi-Fi"
+
+config FYP_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        SSID used by the ESP32 station connection.
+
+config FYP_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+    help
+        Password used by the ESP32 station connection.
+
+endmenu

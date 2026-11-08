@@ -1,13 +1,21 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+
+#include "sdkconfig.h"
 
 #define I2C_SDA_GPIO        21
 #define I2C_SCL_GPIO        22
@@ -42,6 +50,23 @@ typedef struct {
 
 static pms5003_data_t pms5003_data;
 static portMUX_TYPE pms5003_data_lock = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    float temperature;
+    float humidity;
+    float illuminance;
+    uint16_t pm1_0;
+    uint16_t pm2_5;
+    uint16_t pm10;
+    bool temperature_valid;
+    bool humidity_valid;
+    bool illuminance_valid;
+    bool pms_valid;
+} sensor_snapshot_t;
+
+static sensor_snapshot_t sensor_snapshot;
+static portMUX_TYPE sensor_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
+static httpd_handle_t sensor_http_server;
 
 // 5x7 glyphs are stored by column, with one extra column between characters.
 static const uint8_t font5x7[][5] = {
@@ -367,8 +392,114 @@ static esp_err_t pms5003_uart_init(void)
     return ESP_OK;
 }
 
+static esp_err_t sensors_http_get_handler(httpd_req_t *request)
+{
+    sensor_snapshot_t snapshot;
+    portENTER_CRITICAL(&sensor_snapshot_lock);
+    snapshot = sensor_snapshot;
+    portEXIT_CRITICAL(&sensor_snapshot_lock);
+
+    char temperature[24], humidity[24], illuminance[24], pm1[16], pm25[16], pm10[16];
+    snprintf(temperature, sizeof(temperature), snapshot.temperature_valid ? "%.2f" : "null", snapshot.temperature);
+    snprintf(humidity, sizeof(humidity), snapshot.humidity_valid ? "%.2f" : "null", snapshot.humidity);
+    snprintf(illuminance, sizeof(illuminance), snapshot.illuminance_valid ? "%.2f" : "null", snapshot.illuminance);
+    snprintf(pm1, sizeof(pm1), snapshot.pms_valid ? "%u" : "null", snapshot.pm1_0);
+    snprintf(pm25, sizeof(pm25), snapshot.pms_valid ? "%u" : "null", snapshot.pm2_5);
+    snprintf(pm10, sizeof(pm10), snapshot.pms_valid ? "%u" : "null", snapshot.pm10);
+    char payload[256];
+    int length = snprintf(payload, sizeof(payload),
+                          "{\"temperature\":%s,\"humidity\":%s,\"illuminance\":%s,\"pm1_0\":%s,\"pm2_5\":%s,\"pm10\":%s,\"unit_pm\":\"ug/m3\"}",
+                          temperature, humidity, illuminance, pm1, pm25, pm10);
+    if (length < 0 || (size_t)length >= sizeof(payload)) {
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON serialization failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_send(request, payload, length);
+}
+static void start_sensor_http_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 4;
+    if (httpd_start(&sensor_http_server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start HTTP server");
+        return;
+    }
+    httpd_uri_t sensors_uri = {
+        .uri = "/api/sensors",
+        .method = HTTP_GET,
+        .handler = sensors_http_get_handler,
+        .user_ctx = NULL,
+    };
+    if (httpd_register_uri_handler(sensor_http_server, &sensors_uri) != ESP_OK) {
+        ESP_LOGE(TAG, "failed to register /api/sensors");
+        httpd_stop(sensor_http_server);
+        sensor_http_server = NULL;
+        return;
+    }
+    ESP_LOGI(TAG, "HTTP server ready at /api/sensors");
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_data;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (sensor_http_server != NULL) {
+            httpd_stop(sensor_http_server);
+            sensor_http_server = NULL;
+        }
+        ESP_LOGW(TAG, "Wi-Fi disconnected; retrying");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Wi-Fi connected, IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+        if (sensor_http_server == NULL) {
+            start_sensor_http_server();
+        }
+    }
+}
+
+static esp_err_t wifi_init_and_start(void)
+{
+    if (strlen(CONFIG_FYP_WIFI_SSID) == 0) {
+        ESP_LOGE(TAG, "Wi-Fi SSID is empty; configure FYP_WIFI_SSID and FYP_WIFI_PASSWORD");
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t error = nvs_flash_init();
+    if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "failed to erase NVS");
+        error = nvs_flash_init();
+    }
+    ESP_RETURN_ON_ERROR(error, TAG, "failed to initialize NVS");
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "failed to initialize network interface");
+    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "failed to create event loop");
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&wifi_config), TAG, "failed to initialize Wi-Fi");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL),
+                        TAG, "failed to register Wi-Fi handler");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL),
+                        TAG, "failed to register IP handler");
+    wifi_config_t station_config = {0};
+    strncpy((char *)station_config.sta.ssid, CONFIG_FYP_WIFI_SSID, sizeof(station_config.sta.ssid));
+    strncpy((char *)station_config.sta.password, CONFIG_FYP_WIFI_PASSWORD,
+            sizeof(station_config.sta.password));
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "failed to set Wi-Fi station mode");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &station_config), TAG,
+                        "failed to set Wi-Fi credentials");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "failed to start Wi-Fi");
+    return ESP_OK;
+}
+
 void app_main(void)
 {
+    if (wifi_init_and_start() != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi/HTTP disabled until credentials are configured");
+    }
+
     // SHT31, BH1750 and OLED share one I2C bus, accessed sequentially by this task.
     i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_NUM_0,
@@ -482,6 +613,19 @@ void app_main(void)
         bool pms_available = pms_data.valid &&
                              (xTaskGetTickCount() - pms_data.last_update <= pdMS_TO_TICKS(5000));
         pms_data.valid = pms_available;
+
+        portENTER_CRITICAL(&sensor_snapshot_lock);
+        sensor_snapshot.temperature = temperature;
+        sensor_snapshot.humidity = humidity;
+        sensor_snapshot.illuminance = illuminance;
+        sensor_snapshot.pm1_0 = pms_data.pm1_0;
+        sensor_snapshot.pm2_5 = pms_data.pm2_5;
+        sensor_snapshot.pm10 = pms_data.pm10;
+        sensor_snapshot.temperature_valid = (sht31_error == ESP_OK);
+        sensor_snapshot.humidity_valid = (sht31_error == ESP_OK);
+        sensor_snapshot.illuminance_valid = (bh1750_read_error == ESP_OK);
+        sensor_snapshot.pms_valid = pms_available;
+        portEXIT_CRITICAL(&sensor_snapshot_lock);
 
         char temperature_text[32];
         char humidity_text[32];
